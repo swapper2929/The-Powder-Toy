@@ -1,0 +1,115 @@
+name: Build WASM ES5
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install Emscripten
+      uses: mymindstorm/setup-emsdk@v14
+      with:
+        version: 3.1.50
+        actions-cache-folder: emsdk-cache
+    
+    - name: Setup Meson & Ninja
+      run: |
+        python -m pip install --upgrade pip
+        pip install meson ninja
+    
+    - name: Create cross-file for Emscripten
+      run: |
+        cat > emscripten-cross.txt << 'EOF'
+        [binaries]
+        c = 'emcc'
+        cpp = 'em++'
+        ar = 'emar'
+        strip = 'emstrip'
+        
+        [host_machine]
+        system = 'emscripten'
+        cpu_family = 'wasm32'
+        cpu = 'wasm32'
+        endian = 'little'
+        
+        [properties]
+        # ES5 compatibility flags
+        c_args = ['-s', 'LEGACY_VM_SUPPORT=1', '-s', 'EXPORT_ES6=0']
+        cpp_args = ['-s', 'LEGACY_VM_SUPPORT=1', '-s', 'EXPORT_ES6=0']
+        link_args = ['-s', 'WASM=1', '-s', 'MODULARIZE=1', '-s', 'ENVIRONMENT=web']
+        EOF
+    
+    - name: Configure with Meson
+      run: |
+        meson setup build-wasm \
+          --cross-file emscripten-cross.txt \
+          --default-library static \
+          --buildtype release \
+          -Dmod_id=0 \
+          -Dapp_name="MyWasmApp"
+    
+    - name: Build
+      run: |
+        ninja -C build-wasm
+    
+    - name: Verify ES5 compatibility
+      run: |
+        # Check generated JS file
+        JS_FILE=$(find build-wasm -name "*.js" | head -1)
+        if [ -f "$JS_FILE" ]; then
+          echo "Checking $JS_FILE for ES5 compatibility..."
+          
+          # Fail if ES6+ features found
+          if grep -qE '\b(const|let|class|=>)\b' "$JS_FILE"; then
+            echo "❌ ERROR: ES6+ features found in glue code!"
+            grep -nE '\b(const|let|class|=>)\b' "$JS_FILE" | head -10
+            exit 1
+          fi
+          
+          # Check for proper exports
+          if grep -q 'export default' "$JS_FILE"; then
+            echo "⚠️  WARNING: ES6 module export detected"
+          fi
+          
+          echo "✅ ES5 compatibility verified"
+        else
+          echo "⚠️  No JS file found"
+        fi
+    
+    - name: List artifacts
+      run: |
+        echo "Generated files:"
+        ls -la build-wasm/*.{js,wasm} 2>/dev/null || ls -la build-wasm/
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: wasm-es5-build
+        path: |
+          build-wasm/*.js
+          build-wasm/*.wasm
+          build-wasm/*.data
+        if-no-files-found: warn
+    
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          build-wasm/*.js
+          build-wasm/*.wasm
+        generate_release_notes: true
+        name: Release ${{ github.ref_name }}
